@@ -34,33 +34,36 @@ The differentiable renderer API is experimental and subject to change!.
 
 ### Coordinate transformation conventions
 
-Rendering requires transformations between several different coordinate frames: world space, view/camera space, NDC space and screen space. At each step it is important to know where the camera is located, how the x,y,z axes are aligned and the possible range of values. The following figure outlines the conventions used PyTorch3d.
+Rendering requires transformations between several different coordinate frames: world space, view/camera space, NDC space and screen space. At each step it is important to know where the camera is located, how the +X, +Y, +Z axes are aligned and the possible range of values. The following figure outlines the conventions used PyTorch3D.
 
 <img src="assets/transformations_overview.png" width="1000">
 
 
+For example, given a teapot mesh, the world coordinate frame, camera coordiante frame and image are show in the figure below. Note that the world and camera coordinate frames have the +z direction pointing in to the page. 
+
+<img src="assets/world_camera_image.png" width="1000">
 
 ---
 
-**NOTE: PyTorch3d vs OpenGL**
+**NOTE: PyTorch3D vs OpenGL**
 
-While we tried to emulate several aspects of OpenGL, the NDC coordinate system in PyTorch3d is **right-handed** compared with a **left-handed** NDC coordinate system in OpenGL (the projection matrix switches the handedness).
-
-In OpenGL, the camera at the origin is looking along `-z` axis in camera space, but it is looking along the `+z` axis in NDC space.
+While we tried to emulate several aspects of OpenGL, there are differences in the coordinate frame conventions. 
+- The default world coordinate frame in PyTorch3D has +Z pointing in to the screen whereas in OpenGL, +Z is pointing out of the screen.  Both are right handed. 
+- The NDC coordinate system in PyTorch3D is **right-handed** compared with a **left-handed** NDC coordinate system in OpenGL (the projection matrix switches the handedness).
 
 <img align="center" src="assets/opengl_coordframes.png" width="300">
 
 ---
 ### A simple renderer
 
-A renderer in PyTorch3d is composed of a **rasterizer** and a **shader**. Create a renderer in a few simple steps:
+A renderer in PyTorch3D is composed of a **rasterizer** and a **shader**. Create a renderer in a few simple steps:
 
 ```
 # Imports
 from pytorch3d.renderer import (
     OpenGLPerspectiveCameras, look_at_view_transform,
     RasterizationSettings, BlendParams,
-    MeshRenderer, MeshRasterizer, PhongShader
+    MeshRenderer, MeshRasterizer, HardPhongShader
 )
 
 # Initialize an OpenGL perspective camera.
@@ -81,6 +84,28 @@ raster_settings = RasterizationSettings(
 # PhongShader, passing in the device on which to initialize the default parameters
 renderer = MeshRenderer(
     rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
-    shader=PhongShader(device=device, cameras=cameras)
+    shader=HardPhongShader(device=device, cameras=cameras)
 )
 ```
+
+### A custom shader
+
+Shaders are the most flexible part of the PyTorch3D rendering API. We have created some examples of shaders in `shaders.py` but this is a non exhaustive set.
+
+A shader can incorporate several steps:
+- **texturing** (e.g interpolation of vertex RGB colors or interpolation of vertex UV coordinates followed by sampling from a texture map (interpolation uses barycentric coordinates output from rasterization))
+- **lighting/shading** (e.g. ambient, diffuse, specular lighting, Phong, Gouraud, Flat)
+- **blending** (e.g. hard blending using only the closest face for each pixel, or soft blending using a weighted sum of the top K faces per pixel)
+
+ We have examples of several combinations of these functions based on the texturing/shading/blending support we have currently. These are summarised in this table below. Many other combinations are possible and we plan to expand the options available for texturing, shading and blending.
+
+
+|Example Shaders  | Vertex Textures| Texture Map| Flat Shading| Gouraud Shading| Phong Shading | Hard blending | Soft Blending |
+| ------------- |:-------------:  | :--------------:| :--------------:| :--------------:| :--------------:|:--------------:|:--------------:|
+| HardPhongShader |  :heavy_check_mark: ||||  :heavy_check_mark: |  :heavy_check_mark:||
+| SoftPhongShader |  :heavy_check_mark: ||||  :heavy_check_mark: | | :heavy_check_mark:|
+| HardGouraudShader |  :heavy_check_mark: |||  :heavy_check_mark: ||  :heavy_check_mark:||
+| SoftGouraudShader |  :heavy_check_mark: |||  :heavy_check_mark: |||  :heavy_check_mark:|
+| TexturedSoftPhongShader ||  :heavy_check_mark: |||  :heavy_check_mark: ||  :heavy_check_mark:|
+| HardFlatShader |  :heavy_check_mark: ||  :heavy_check_mark: |||  :heavy_check_mark:||
+| SoftSilhouetteShader |||||||  :heavy_check_mark:|

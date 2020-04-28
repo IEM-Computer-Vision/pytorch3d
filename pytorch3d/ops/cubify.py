@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 import torch
 import torch.nn.functional as F
-
 from pytorch3d.structures import Meshes
 
 
@@ -201,8 +199,6 @@ def cubify(voxels, thresh, device=None) -> Meshes:
         grid_verts.index_select(0, (idleverts[n] == 0).nonzero()[:, 0])
         for n in range(N)
     ]
-    faces_list = [
-        nface - idlenum[n][nface] for n, nface in enumerate(faces_list)
-    ]
+    faces_list = [nface - idlenum[n][nface] for n, nface in enumerate(faces_list)]
 
     return Meshes(verts=verts_list, faces=faces_list)

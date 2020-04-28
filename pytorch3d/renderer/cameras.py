@@ -1,22 +1,217 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import math
+from typing import Optional, Sequence, Tuple
+
 import numpy as np
-from typing import Tuple
 import torch
 import torch.nn.functional as F
-
 from pytorch3d.transforms import Rotate, Transform3d, Translate
 
 from .utils import TensorProperties, convert_to_tensors_and_broadcast
+
 
 # Default values for rotation and translation matrices.
 r = np.expand_dims(np.eye(3), axis=0)  # (1, 3, 3)
 t = np.expand_dims(np.zeros(3), axis=0)  # (1, 3)
 
 
-class OpenGLPerspectiveCameras(TensorProperties):
+class CamerasBase(TensorProperties):
+    """
+    `CamerasBase` implements a base class for all cameras.
+
+    It defines methods that are common to all camera models:
+        - `get_camera_center` that returns the optical center of the camera in
+    world coordinates
+        - `get_world_to_view_transform` which returns a 3D transform from
+    world coordinates to the camera coordinates
+        - `get_full_projection_transform` which composes the projection
+    transform with the world-to-view transform
+        - `transform_points` which takes a set of input points and
+    projects them onto a 2D camera plane.
+
+    For each new camera, one should implement the `get_projection_transform`
+    routine that returns the mapping from camera coordinates in world units
+    to the screen coordinates.
+
+    Another useful function that is specific to each camera model is
+    `unproject_points` which sends points from screen coordinates back to
+    camera or world coordinates depending on the `world_coordinates`
+    boolean argument of the function.
+    """
+
+    def get_projection_transform(self):
+        """
+        Calculate the projective transformation matrix.
+
+        Args:
+            **kwargs: parameters for the projection can be passed in as keyword
+                arguments to override the default values set in `__init__`.
+
+        Return:
+            P: a `Transform3d` object which represents a batch of projection
+            matrices of shape (N, 3, 3)
+        """
+        raise NotImplementedError()
+
+    def unproject_points(self):
+        """
+        Transform input points in screen coodinates
+        to the world / camera coordinates.
+
+        Each of the input points `xy_depth` of shape (..., 3) is
+        a concatenation of the x, y location and its depth.
+
+        For instance, for an input 2D tensor of shape `(num_points, 3)`
+        `xy_depth` takes the following form:
+            `xy_depth[i] = [x[i], y[i], depth[i]]`,
+        for a each point at an index `i`.
+
+        The following example demonstrates the relationship between
+        `transform_points` and `unproject_points`:
+
+        .. code-block:: python
+
+            cameras = # camera object derived from CamerasBase
+            xyz = # 3D points of shape (batch_size, num_points, 3)
+            # transform xyz to the camera coordinates
+            xyz_cam = cameras.get_world_to_view_transform().transform_points(xyz)
+            # extract the depth of each point as the 3rd coord of xyz_cam
+            depth = xyz_cam[:, :, 2:]
+            # project the points xyz to the camera
+            xy = cameras.transform_points(xyz)[:, :, :2]
+            # append depth to xy
+            xy_depth = torch.cat((xy, depth), dim=2)
+            # unproject to the world coordinates
+            xyz_unproj_world = cameras.unproject_points(xy_depth, world_coordinates=True)
+            print(torch.allclose(xyz, xyz_unproj_world)) # True
+            # unproject to the camera coordinates
+            xyz_unproj = cameras.unproject_points(xy_depth, world_coordinates=False)
+            print(torch.allclose(xyz_cam, xyz_unproj)) # True
+
+        Args:
+            xy_depth: torch tensor of shape (..., 3).
+            world_coordinates: If `True`, unprojects the points back to world
+                coordinates using the camera extrinsics `R` and `T`.
+                `False` ignores `R` and `T` and unprojects to
+                the camera coordinates.
+
+        Returns
+            new_points: unprojected points with the same shape as `xy_depth`.
+        """
+        raise NotImplementedError()
+
+    def get_camera_center(self, **kwargs) -> torch.Tensor:
+        """
+        Return the 3D location of the camera optical center
+        in the world coordinates.
+
+        Args:
+            **kwargs: parameters for the camera extrinsics can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+
+        Setting T here will update the values set in init as this
+        value may be needed later on in the rendering pipeline e.g. for
+        lighting calculations.
+
+        Returns:
+            C: a batch of 3D locations of shape (N, 3) denoting
+            the locations of the center of each camera in the batch.
+        """
+        w2v_trans = self.get_world_to_view_transform(**kwargs)
+        P = w2v_trans.inverse().get_matrix()
+        # the camera center is the translation component (the first 3 elements
+        # of the last row) of the inverted world-to-view
+        # transform (4x4 RT matrix)
+        C = P[:, 3, :3]
+        return C
+
+    def get_world_to_view_transform(self, **kwargs) -> Transform3d:
+        """
+        Return the world-to-view transform.
+
+        Args:
+            **kwargs: parameters for the camera extrinsics can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+
+        Setting R and T here will update the values set in init as these
+        values may be needed later on in the rendering pipeline e.g. for
+        lighting calculations.
+
+        Returns:
+            T: a Transform3d object which represents a batch of transforms
+            of shape (N, 3, 3)
+        """
+        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
+        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
+        world_to_view_transform = get_world_to_view_transform(R=self.R, T=self.T)
+        return world_to_view_transform
+
+    def get_full_projection_transform(self, **kwargs) -> Transform3d:
+        """
+        Return the full world-to-screen transform composing the
+        world-to-view and view-to-screen transforms.
+
+        Args:
+            **kwargs: parameters for the projection transforms can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+
+        Setting R and T here will update the values set in init as these
+        values may be needed later on in the rendering pipeline e.g. for
+        lighting calculations.
+
+        Returns:
+            T: a Transform3d object which represents a batch of transforms
+            of shape (N, 3, 3)
+        """
+        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
+        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
+        world_to_view_transform = self.get_world_to_view_transform(R=self.R, T=self.T)
+        view_to_screen_transform = self.get_projection_transform(**kwargs)
+        return world_to_view_transform.compose(view_to_screen_transform)
+
+    def transform_points(
+        self, points, eps: Optional[float] = None, **kwargs
+    ) -> torch.Tensor:
+        """
+        Transform input points from world to screen space.
+
+        Args:
+            points: torch tensor of shape (..., 3).
+            eps: If eps!=None, the argument is used to clamp the
+                divisor in the homogeneous normalization of the points
+                transformed to the screen space. Plese see
+                `transforms.Transform3D.transform_points` for details.
+
+                For `CamerasBase.transform_points`, setting `eps > 0`
+                stabilizes gradients since it leads to avoiding division
+                by excessivelly low numbers for points close to the
+                camera plane.
+
+        Returns
+            new_points: transformed points with the same shape as the input.
+        """
+        world_to_screen_transform = self.get_full_projection_transform(**kwargs)
+        return world_to_screen_transform.transform_points(points, eps=eps)
+
+    def clone(self):
+        """
+        Returns a copy of `self`.
+        """
+        cam_type = type(self)
+        other = cam_type(device=self.device)
+        return super().clone(other)
+
+
+########################
+# Specific camera classes
+########################
+
+
+class OpenGLPerspectiveCameras(CamerasBase):
     """
     A class which stores a batch of parameters to generate a batch of
     projection matrices using the OpenGL convention for a perspective camera.
@@ -97,20 +292,17 @@ class OpenGLPerspectiveCameras(TensorProperties):
                     [s1,   0,   w1,   0],
                     [0,   s2,   h1,   0],
                     [0,    0,   f1,  f2],
-                    [0,    0,   -1,   0],
+                    [0,    0,    1,   0],
             ]
         """
         znear = kwargs.get("znear", self.znear)  # pyre-ignore[16]
         zfar = kwargs.get("zfar", self.zfar)  # pyre-ignore[16]
         fov = kwargs.get("fov", self.fov)  # pyre-ignore[16]
-        aspect_ratio = kwargs.get(
-            "aspect_ratio", self.aspect_ratio
-        )  # pyre-ignore[16]
+        # pyre-ignore[16]
+        aspect_ratio = kwargs.get("aspect_ratio", self.aspect_ratio)
         degrees = kwargs.get("degrees", self.degrees)
 
-        P = torch.zeros(
-            (self._N, 4, 4), device=self.device, dtype=torch.float32
-        )
+        P = torch.zeros((self._N, 4, 4), device=self.device, dtype=torch.float32)
         ones = torch.ones((self._N), dtype=torch.float32, device=self.device)
         if degrees:
             fov = (np.pi / 180) * fov
@@ -157,101 +349,52 @@ class OpenGLPerspectiveCameras(TensorProperties):
         transform._matrix = P.transpose(1, 2).contiguous()
         return transform
 
-    def clone(self):
-        other = OpenGLPerspectiveCameras(device=self.device)
-        return super().clone(other)
-
-    def get_camera_center(self, **kwargs):
-        """
-        Return the 3D location of the camera optical center
-        in the world coordinates.
-
-        Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting T here will update the values set in init as this
-        value may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            C: a batch of 3D locations of shape (N, 3) denoting
-            the locations of the center of each camera in the batch.
-        """
-        w2v_trans = self.get_world_to_view_transform(**kwargs)
-        P = w2v_trans.inverse().get_matrix()
-        # the camera center is the translation component (the first 3 elements
-        # of the last row) of the inverted world-to-view
-        # transform (4x4 RT matrix)
-        C = P[:, 3, :3]
-        return C
-
-    def get_world_to_view_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the world-to-view transform.
+    def unproject_points(
+        self,
+        xy_depth: torch.Tensor,
+        world_coordinates: bool = True,
+        scaled_depth_input: bool = False,
+        **kwargs
+    ) -> torch.Tensor:
+        """>!
+        OpenGL cameras further allow for passing depth in world units
+        (`scaled_depth_input=False`) or in the [0, 1]-normalized units
+        (`scaled_depth_input=True`)
 
         Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            T: a Transform3d object which represents a batch of transforms
-            of shape (N, 3, 3)
+            scaled_depth_input: If `True`, assumes the input depth is in
+                the [0, 1]-normalized units. If `False` the input depth is in
+                the world units.
         """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        return world_to_view_transform
 
-    def get_full_projection_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the full world-to-screen transform composing the
-        world-to-view and view-to-screen transforms.
+        # obtain the relevant transformation to screen
+        if world_coordinates:
+            to_screen_transform = self.get_full_projection_transform()
+        else:
+            to_screen_transform = self.get_projection_transform()
 
-        Args:
-            **kwargs: parameters for the projection transforms can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
+        if scaled_depth_input:
+            # the input is scaled depth, so we don't have to do anything
+            xy_sdepth = xy_depth
+        else:
+            # parse out important values from the projection matrix
+            P_matrix = self.get_projection_transform(**kwargs.copy()).get_matrix()
+            # parse out f1, f2 from P_matrix
+            unsqueeze_shape = [1] * xy_depth.dim()
+            unsqueeze_shape[0] = P_matrix.shape[0]
+            f1 = P_matrix[:, 2, 2].reshape(unsqueeze_shape)
+            f2 = P_matrix[:, 3, 2].reshape(unsqueeze_shape)
+            # get the scaled depth
+            sdepth = (f1 * xy_depth[..., 2:3] + f2) / xy_depth[..., 2:3]
+            # concatenate xy + scaled depth
+            xy_sdepth = torch.cat((xy_depth[..., 0:2], sdepth), dim=-1)
 
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            T: a Transform3d object which represents a batch of transforms
-            of shape (N, 3, 3)
-        """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = self.get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        view_to_screen_transform = self.get_projection_transform(**kwargs)
-        return world_to_view_transform.compose(view_to_screen_transform)
-
-    def transform_points(self, points, **kwargs) -> torch.Tensor:
-        """
-        Transform input points from world to screen space.
-
-        Args:
-            points: torch tensor of shape (..., 3).
-
-        Returns
-            new_points: transformed points with the same shape as the input.
-        """
-        world_to_screen_transform = self.get_full_projection_transform(**kwargs)
-        return world_to_screen_transform.transform_points(points)
+        # unproject with inverse of the projection
+        unprojection_transform = to_screen_transform.inverse()
+        return unprojection_transform.transform_points(xy_sdepth)
 
 
-class OpenGLOrthographicCameras(TensorProperties):
+class OpenGLOrthographicCameras(CamerasBase):
     """
     A class which stores a batch of parameters to generate a batch of
     transformation matrices using the OpenGL convention for orthographic camera.
@@ -339,12 +482,10 @@ class OpenGLOrthographicCameras(TensorProperties):
         bottom = kwargs.get("bottom", self.bottom)  # pyre-ignore[16]
         scale_xyz = kwargs.get("scale_xyz", self.scale_xyz)  # pyre-ignore[16]
 
-        P = torch.zeros(
-            (self._N, 4, 4), dtype=torch.float32, device=self.device
-        )
+        P = torch.zeros((self._N, 4, 4), dtype=torch.float32, device=self.device)
         ones = torch.ones((self._N), dtype=torch.float32, device=self.device)
         # NOTE: OpenGL flips handedness of coordinate system between camera
-        # space and NDC space so z sign is -ve. In PyTorch3d we maintain a
+        # space and NDC space so z sign is -ve. In PyTorch3D we maintain a
         # right handed coordinate system throughout.
         z_sign = +1.0
 
@@ -369,102 +510,48 @@ class OpenGLOrthographicCameras(TensorProperties):
         transform._matrix = P.transpose(1, 2).contiguous()
         return transform
 
-    def clone(self):
-        other = OpenGLOrthographicCameras(device=self.device)
-        return super().clone(other)
-
-    def get_camera_center(self, **kwargs):
-        """
-        Return the 3D location of the camera optical center
-        in the world coordinates.
-
-        Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting T here will update the values set in init as this
-        value may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-
-        Returns:
-            C: a batch of 3D locations of shape (N, 3) denoting
-            the locations of the center of each camera in the batch.
-        """
-        w2v_trans = self.get_world_to_view_transform(**kwargs)
-        P = w2v_trans.inverse().get_matrix()
-        # The camera center is the translation component (the first 3 elements
-        # of the last row) of the inverted world-to-view
-        # transform (4x4 RT matrix).
-        C = P[:, 3, :3]
-        return C
-
-    def get_world_to_view_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the world-to-view transform.
+    def unproject_points(
+        self,
+        xy_depth: torch.Tensor,
+        world_coordinates: bool = True,
+        scaled_depth_input: bool = False,
+        **kwargs
+    ) -> torch.Tensor:
+        """>!
+        OpenGL cameras further allow for passing depth in world units
+        (`scaled_depth_input=False`) or in the [0, 1]-normalized units
+        (`scaled_depth_input=True`)
 
         Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            T: a Transform3d object which represents a batch of transforms
-            of shape (N, 3, 3)
+            scaled_depth_input: If `True`, assumes the input depth is in
+                the [0, 1]-normalized units. If `False` the input depth is in
+                the world units.
         """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        return world_to_view_transform
 
-    def get_full_projection_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the full world-to-screen transform composing the
-        world-to-view and view-to-screen transforms.
+        if world_coordinates:
+            to_screen_transform = self.get_full_projection_transform(**kwargs.copy())
+        else:
+            to_screen_transform = self.get_projection_transform(**kwargs.copy())
 
-        Args:
-            **kwargs: parameters for the projection transforms can be passed in
-                as keyword arguments to override the default values
-                set in `__init__`.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            T: a Transform3d object which represents a batch of transforms
-            of shape (N, 3, 3)
-        """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = self.get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        view_to_screen_transform = self.get_projection_transform(**kwargs)
-        return world_to_view_transform.compose(view_to_screen_transform)
-
-    def transform_points(self, points, **kwargs) -> torch.Tensor:
-        """
-        Transform input points from world to screen space.
-
-        Args:
-            points: torch tensor of shape (..., 3).
-
-        Returns
-            new_points: transformed points with the same shape as the input.
-        """
-        world_to_screen_transform = self.get_full_projection_transform(**kwargs)
-        return world_to_screen_transform.transform_points(points)
+        if scaled_depth_input:
+            # the input depth is already scaled
+            xy_sdepth = xy_depth
+        else:
+            # we have to obtain the scaled depth first
+            P = self.get_projection_transform(**kwargs).get_matrix()
+            unsqueeze_shape = [1] * P.dim()
+            unsqueeze_shape[0] = P.shape[0]
+            mid_z = P[:, 3, 2].reshape(unsqueeze_shape)
+            scale_z = P[:, 2, 2].reshape(unsqueeze_shape)
+            scaled_depth = scale_z * xy_depth[..., 2:3] + mid_z
+            # cat xy and scaled depth
+            xy_sdepth = torch.cat((xy_depth[..., :2], scaled_depth), dim=-1)
+        # finally invert the transform
+        unprojection_transform = to_screen_transform.inverse()
+        return unprojection_transform.transform_points(xy_sdepth)
 
 
-class SfMPerspectiveCameras(TensorProperties):
+class SfMPerspectiveCameras(CamerasBase):
     """
     A class which stores a batch of parameters to generate a batch of
     transformation matrices using the multi-view geometry convention for
@@ -472,12 +559,7 @@ class SfMPerspectiveCameras(TensorProperties):
     """
 
     def __init__(
-        self,
-        focal_length=1.0,
-        principal_point=((0.0, 0.0),),
-        R=r,
-        T=t,
-        device="cpu",
+        self, focal_length=1.0, principal_point=((0.0, 0.0),), R=r, T=t, device="cpu"
     ):
         """
         __init__(self, focal_length, principal_point, R, T, device) -> None
@@ -513,28 +595,26 @@ class SfMPerspectiveCameras(TensorProperties):
                 arguments to override the default values set in __init__.
 
         Returns:
-            P: a batch of projection matrices of shape (N, 4, 4)
+            P: A `Transform3d` object with a batch of `N` projection transforms.
 
         .. code-block:: python
 
-            fx = focal_length[:,0]
-            fy = focal_length[:,1]
-            px = principal_point[:,0]
-            py = principal_point[:,1]
+            fx = focal_length[:, 0]
+            fy = focal_length[:, 1]
+            px = principal_point[:, 0]
+            py = principal_point[:, 1]
 
             P = [
-                    [fx,   0,    0,  px],
-                    [0,   fy,    0,  py],
+                    [fx,   0,   px,   0],
+                    [0,   fy,   py,   0],
                     [0,    0,    0,   1],
                     [0,    0,    1,   0],
             ]
         """
-        principal_point = kwargs.get(
-            "principal_point", self.principal_point
-        )  # pyre-ignore[16]
-        focal_length = kwargs.get(
-            "focal_length", self.focal_length
-        )  # pyre-ignore[16]
+        # pyre-ignore[16]
+        principal_point = kwargs.get("principal_point", self.principal_point)
+        # pyre-ignore[16]
+        focal_length = kwargs.get("focal_length", self.focal_length)
 
         P = _get_sfm_calibration_matrix(
             self._N, self.device, focal_length, principal_point, False
@@ -544,97 +624,22 @@ class SfMPerspectiveCameras(TensorProperties):
         transform._matrix = P.transpose(1, 2).contiguous()
         return transform
 
-    def clone(self):
-        other = SfMPerspectiveCameras(device=self.device)
-        return super().clone(other)
+    def unproject_points(
+        self, xy_depth: torch.Tensor, world_coordinates: bool = True, **kwargs
+    ) -> torch.Tensor:
+        if world_coordinates:
+            to_screen_transform = self.get_full_projection_transform(**kwargs)
+        else:
+            to_screen_transform = self.get_projection_transform(**kwargs)
 
-    def get_camera_center(self, **kwargs):
-        """
-        Return the 3D location of the camera optical center
-        in the world coordinates.
-
-        Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting T here will update the values set in init as this
-        value may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            C: a batch of 3D locations of shape (N, 3) denoting
-            the locations of the center of each camera in the batch.
-        """
-        w2v_trans = self.get_world_to_view_transform(**kwargs)
-        P = w2v_trans.inverse().get_matrix()
-        # the camera center is the translation component (the first 3 elements
-        # of the last row) of the inverted world-to-view
-        # transform (4x4 RT matrix)
-        C = P[:, 3, :3]
-        return C
-
-    def get_world_to_view_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the world-to-view transform.
-
-        Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            T: a Transform3d object which represents a batch of transforms
-            of shape (N, 3, 3)
-        """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = get_world_to_view_transform(
-            R=self.R, T=self.T
+        unprojection_transform = to_screen_transform.inverse()
+        xy_inv_depth = torch.cat(
+            (xy_depth[..., :2], 1.0 / xy_depth[..., 2:3]), dim=-1  # type: ignore
         )
-        return world_to_view_transform
-
-    def get_full_projection_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the full world-to-screen transform composing the
-        world-to-view and view-to-screen transforms.
-
-        Args:
-            **kwargs: parameters for the projection transforms can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-        """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = self.get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        view_to_screen_transform = self.get_projection_transform(**kwargs)
-        return world_to_view_transform.compose(view_to_screen_transform)
-
-    def transform_points(self, points, **kwargs) -> torch.Tensor:
-        """
-        Transform input points from world to screen space.
-
-        Args:
-            points: torch tensor of shape (..., 3).
-
-        Returns
-            new_points: transformed points with the same shape as the input.
-        """
-        world_to_screen_transform = self.get_full_projection_transform(**kwargs)
-        return world_to_screen_transform.transform_points(points)
+        return unprojection_transform.transform_points(xy_inv_depth)
 
 
-class SfMOrthographicCameras(TensorProperties):
+class SfMOrthographicCameras(CamerasBase):
     """
     A class which stores a batch of parameters to generate a batch of
     transformation matrices using the multi-view geometry convention for
@@ -642,12 +647,7 @@ class SfMOrthographicCameras(TensorProperties):
     """
 
     def __init__(
-        self,
-        focal_length=1.0,
-        principal_point=((0.0, 0.0),),
-        R=r,
-        T=t,
-        device="cpu",
+        self, focal_length=1.0, principal_point=((0.0, 0.0),), R=r, T=t, device="cpu"
     ):
         """
         __init__(self, focal_length, principal_point, R, T, device) -> None
@@ -682,8 +682,8 @@ class SfMOrthographicCameras(TensorProperties):
             **kwargs: parameters for the projection can be passed in as keyword
                 arguments to override the default values set in __init__.
 
-        Return:
-            P: a batch of projection matrices of shape (N, 4, 4)
+        Returns:
+            P: A `Transform3d` object with a batch of `N` projection transforms.
 
         .. code-block:: python
 
@@ -699,12 +699,10 @@ class SfMOrthographicCameras(TensorProperties):
                     [0,    0,    0,   1],
             ]
         """
-        principal_point = kwargs.get(
-            "principal_point", self.principal_point
-        )  # pyre-ignore[16]
-        focal_length = kwargs.get(
-            "focal_length", self.focal_length
-        )  # pyre-ignore[16]
+        # pyre-ignore[16]
+        principal_point = kwargs.get("principal_point", self.principal_point)
+        # pyre-ignore[16]
+        focal_length = kwargs.get("focal_length", self.focal_length)
 
         P = _get_sfm_calibration_matrix(
             self._N, self.device, focal_length, principal_point, True
@@ -714,94 +712,16 @@ class SfMOrthographicCameras(TensorProperties):
         transform._matrix = P.transpose(1, 2).contiguous()
         return transform
 
-    def clone(self):
-        other = SfMOrthographicCameras(device=self.device)
-        return super().clone(other)
+    def unproject_points(
+        self, xy_depth: torch.Tensor, world_coordinates: bool = True, **kwargs
+    ) -> torch.Tensor:
+        if world_coordinates:
+            to_screen_transform = self.get_full_projection_transform(**kwargs)
+        else:
+            to_screen_transform = self.get_projection_transform(**kwargs)
 
-    def get_camera_center(self, **kwargs):
-        """
-        Return the 3D location of the camera optical center
-        in the world coordinates.
-
-        Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting T here will update the values set in init as this
-        value may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            C: a batch of 3D locations of shape (N, 3) denoting
-            the locations of the center of each camera in the batch.
-        """
-        w2v_trans = self.get_world_to_view_transform(**kwargs)
-        P = w2v_trans.inverse().get_matrix()
-        # the camera center is the translation component (the first 3 elements
-        # of the last row) of the inverted world-to-view
-        # transform (4x4 RT matrix)
-        C = P[:, 3, :3]
-        return C
-
-    def get_world_to_view_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the world-to-view transform.
-
-        Args:
-            **kwargs: parameters for the camera extrinsics can be passed in
-                as keyword arguments to override the default values
-                set in __init__.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-
-        Returns:
-            T: a Transform3d object which represents a batch of transforms
-            of shape (N, 3, 3)
-        """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        return world_to_view_transform
-
-    def get_full_projection_transform(self, **kwargs) -> Transform3d:
-        """
-        Return the full world-to-screen transform composing the
-        world-to-view and view-to-screen transforms.
-
-        Args:
-            **kwargs: parameters for the projection transforms can be passed in
-                as keyword arguments to override the default values
-                set in `__init__`.
-
-        Setting R and T here will update the values set in init as these
-        values may be needed later on in the rendering pipeline e.g. for
-        lighting calculations.
-        """
-        self.R = kwargs.get("R", self.R)  # pyre-ignore[16]
-        self.T = kwargs.get("T", self.T)  # pyre-ignore[16]
-        world_to_view_transform = self.get_world_to_view_transform(
-            R=self.R, T=self.T
-        )
-        view_to_screen_transform = self.get_projection_transform(**kwargs)
-        return world_to_view_transform.compose(view_to_screen_transform)
-
-    def transform_points(self, points, **kwargs) -> torch.Tensor:
-        """
-        Transform input points from world to screen space.
-
-        Args:
-            points: torch tensor of shape (..., 3).
-
-        Returns
-            new_points: transformed points with the same shape as the input.
-        """
-        world_to_screen_transform = self.get_full_projection_transform(**kwargs)
-        return world_to_screen_transform.transform_points(points)
+        unprojection_transform = to_screen_transform.inverse()
+        return unprojection_transform.transform_points(xy_depth)
 
 
 # SfMCameras helper
@@ -835,8 +755,8 @@ def _get_sfm_calibration_matrix(
                 ]
             else:
                 K = [
-                        [fx,   0,    0,  px],
-                        [0,   fy,    0,  py],
+                        [fx,   0,   px,   0],
+                        [0,   fy,   py,   0],
                         [0,    0,    0,   1],
                         [0,    0,    1,   0],
                 ]
@@ -862,12 +782,14 @@ def _get_sfm_calibration_matrix(
     K = fx.new_zeros(N, 4, 4)
     K[:, 0, 0] = fx
     K[:, 1, 1] = fy
-    K[:, 0, 3] = px
-    K[:, 1, 3] = py
     if orthographic:
+        K[:, 0, 3] = px
+        K[:, 1, 3] = py
         K[:, 2, 2] = 1.0
         K[:, 3, 3] = 1.0
     else:
+        K[:, 0, 2] = px
+        K[:, 1, 2] = py
         K[:, 3, 2] = 1.0
         K[:, 2, 3] = 1.0
 
@@ -885,7 +807,7 @@ def get_world_to_view_transform(R=r, T=t) -> Transform3d:
     matrix to go from world space to view space by applying a rotation and
     a translation.
 
-    Pytorch3d uses the same convention as Hartley & Zisserman.
+    PyTorch3D uses the same convention as Hartley & Zisserman.
     I.e., for camera extrinsic parameters R (rotation) and T (translation),
     we map a 3D point `X_world` in world coordinates to
     a point `X_cam` in camera coordinates with:
@@ -910,7 +832,7 @@ def get_world_to_view_transform(R=r, T=t) -> Transform3d:
         raise ValueError(msg % repr(T.shape))
     if R.dim() != 3 or R.shape[1:] != (3, 3):
         msg = "Expected R to have shape (N, 3, 3); got %r"
-        raise ValueError(msg % R.shape)
+        raise ValueError(msg % repr(R.shape))
 
     # Create a Transform3d object
     T = Translate(T, device=T.device)
@@ -949,7 +871,7 @@ def camera_position_from_spherical_angles(
         azim = math.pi / 180.0 * azim
     x = dist * torch.cos(elev) * torch.sin(azim)
     y = dist * torch.sin(elev)
-    z = -dist * torch.cos(elev) * torch.cos(azim)
+    z = dist * torch.cos(elev) * torch.cos(azim)
     camera_position = torch.stack([x, y, z], dim=1)
     if camera_position.dim() == 0:
         camera_position = camera_position.view(1, -1)  # add batch dim.
@@ -996,17 +918,16 @@ def look_at_rotation(
     z_axis = F.normalize(at - camera_position, eps=1e-5)
     x_axis = F.normalize(torch.cross(up, z_axis), eps=1e-5)
     y_axis = F.normalize(torch.cross(z_axis, x_axis), eps=1e-5)
-    R = torch.cat(
-        (x_axis[:, None, :], y_axis[:, None, :], z_axis[:, None, :]), dim=1
-    )
+    R = torch.cat((x_axis[:, None, :], y_axis[:, None, :], z_axis[:, None, :]), dim=1)
     return R.transpose(1, 2)
 
 
 def look_at_view_transform(
-    dist,
-    elev,
-    azim,
+    dist=1.0,
+    elev=0.0,
+    azim=0.0,
     degrees: bool = True,
+    eye: Optional[Sequence] = None,
     at=((0, 0, 0),),  # (1, 3)
     up=((0, 1, 0),),  # (1, 3)
     device="cpu",
@@ -1018,17 +939,19 @@ def look_at_view_transform(
     Args:
         dist: distance of the camera from the object
         elev: angle in degres or radians. This is the angle between the
-            vector from the object to the camera, and the horizonal plane.
+            vector from the object to the camera, and the horizontal plane y = 0 (xz-plane).
         azim: angle in degrees or radians. The vector from the object to
-            the camera is projected onto a horizontal plane y = z = 0.
+            the camera is projected onto a horizontal plane y = 0.
             azim is the angle between the projected vector and a
-            reference vector at (1, 0, 0) on the reference plane.
+            reference vector at (1, 0, 0) on the reference plane (the horizontal plane).
         dist, elem and azim can be of shape (1), (N).
         degrees: boolean flag to indicate if the elevation and azimuth
-            angles are specified in degrees or raidans.
+            angles are specified in degrees or radians.
+        eye: the position of the camera(s) in world coordinates. If eye is not
+            None, it will overide the camera position derived from dist, elev, azim.
         up: the direction of the x axis in the world coordinate system.
         at: the position of the object(s) in world coordinates.
-        up and at can be of shape (1, 3) or (N, 3).
+        eye, up and at can be of shape (1, 3) or (N, 3).
 
     Returns:
         2-element tuple containing
@@ -1039,11 +962,20 @@ def look_at_view_transform(
     References:
     [0] https://www.scratchapixel.com
     """
-    broadcasted_args = convert_to_tensors_and_broadcast(
-        dist, elev, azim, at, up, device=device
-    )
-    dist, elev, azim, at, up = broadcasted_args
-    C = camera_position_from_spherical_angles(dist, elev, azim, device=device)
+
+    if eye is not None:
+        broadcasted_args = convert_to_tensors_and_broadcast(eye, at, up, device=device)
+        eye, at, up = broadcasted_args
+        C = eye
+    else:
+        broadcasted_args = convert_to_tensors_and_broadcast(
+            dist, elev, azim, at, up, device=device
+        )
+        dist, elev, azim, at, up = broadcasted_args
+        C = camera_position_from_spherical_angles(
+            dist, elev, azim, degrees=degrees, device=device
+        )
+
     R = look_at_rotation(C, at, up, device=device)
     T = -torch.bmm(R.transpose(1, 2), C[:, :, None])[:, :, 0]
     return R, T

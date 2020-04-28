@@ -1,15 +1,19 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
-import numpy as np
 from typing import Optional
-import torch
 
+import numpy as np
+import torch
 from pytorch3d import _C
 
+
 # TODO make the epsilon user configurable
-kEpsilon = 1e-30
+kEpsilon = 1e-8
+
+# Maxinum number of faces per bins for
+# coarse-to-fine rasterization
+kMaxFacesPerBin = 22
 
 
 def rasterize_meshes(
@@ -20,6 +24,7 @@ def rasterize_meshes(
     bin_size: Optional[int] = None,
     max_faces_per_bin: Optional[int] = None,
     perspective_correct: bool = False,
+    cull_backfaces: bool = False,
 ):
     """
     Rasterize a batch of meshes given the shape of the desired output image.
@@ -45,8 +50,16 @@ def rasterize_meshes(
             bin. If more than this many faces actually fall into a bin, an error
             will be raised. This should not affect the output values, but can affect
             the memory usage in the forward pass.
-        perspective_correct: Whether to apply perspective correction when computing
+        perspective_correct: Bool, Whether to apply perspective correction when computing
             barycentric coordinates for pixels.
+        cull_backfaces: Bool, Whether to only rasterize mesh faces which are
+            visible to the camera.  This assumes that vertices of
+            front-facing triangles are ordered in an anti-clockwise
+            fashion, and triangles that face away from the camera are
+            in a clockwise order relative to the current view
+            direction. NOTE: This will only work if the mesh faces are
+            consistently defined with counter-clockwise ordering when
+            viewed from the outside.
 
     Returns:
         4-element tuple containing
@@ -98,12 +111,23 @@ def rasterize_meshes(
             # TODO better heuristics for bin size.
             if image_size <= 64:
                 bin_size = 8
-            elif image_size <= 256:
-                bin_size = 16
-            elif image_size <= 512:
-                bin_size = 32
-            elif image_size <= 1024:
-                bin_size = 64
+            else:
+                # Heuristic based formula maps image_size -> bin_size as follows:
+                # image_size < 64 -> 8
+                # 16 < image_size < 256 -> 16
+                # 256 < image_size < 512 -> 32
+                # 512 < image_size < 1024 -> 64
+                # 1024 < image_size < 2048 -> 128
+                bin_size = int(2 ** max(np.ceil(np.log2(image_size)) - 4, 4))
+
+    if bin_size != 0:
+        # There is a limit on the number of faces per bin in the cuda kernel.
+        faces_per_bin = 1 + (image_size - 1) // bin_size
+        if faces_per_bin >= kMaxFacesPerBin:
+            raise ValueError(
+                "bin_size too small, number of faces per bin must be less than %d; got %d"
+                % (kMaxFacesPerBin, faces_per_bin)
+            )
 
     if max_faces_per_bin is None:
         max_faces_per_bin = int(max(10000, verts_packed.shape[0] / 5))
@@ -118,6 +142,7 @@ def rasterize_meshes(
         bin_size,
         max_faces_per_bin,
         perspective_correct,
+        cull_backfaces,
     )
 
 
@@ -139,6 +164,7 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             for each mesh in the batch.
         image_size, blur_radius, faces_per_pixel: same as rasterize_meshes.
         perspective_correct: same as rasterize_meshes.
+        cull_backfaces: same as rasterize_meshes.
 
     Returns:
         same as rasterize_meshes function.
@@ -156,6 +182,7 @@ class _RasterizeFaceVerts(torch.autograd.Function):
         bin_size: int = 0,
         max_faces_per_bin: int = 0,
         perspective_correct: bool = False,
+        cull_backfaces: bool = False,
     ):
         pix_to_face, zbuf, barycentric_coords, dists = _C.rasterize_meshes(
             face_verts,
@@ -167,15 +194,14 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             bin_size,
             max_faces_per_bin,
             perspective_correct,
+            cull_backfaces,
         )
         ctx.save_for_backward(face_verts, pix_to_face)
         ctx.perspective_correct = perspective_correct
         return pix_to_face, zbuf, barycentric_coords, dists
 
     @staticmethod
-    def backward(
-        ctx, grad_pix_to_face, grad_zbuf, grad_barycentric_coords, grad_dists
-    ):
+    def backward(ctx, grad_pix_to_face, grad_zbuf, grad_barycentric_coords, grad_dists):
         grad_face_verts = None
         grad_mesh_to_face_first_idx = None
         grad_num_faces_per_mesh = None
@@ -185,6 +211,7 @@ class _RasterizeFaceVerts(torch.autograd.Function):
         grad_bin_size = None
         grad_max_faces_per_bin = None
         grad_perspective_correct = None
+        grad_cull_backfaces = None
         face_verts, pix_to_face = ctx.saved_tensors
         grad_face_verts = _C.rasterize_meshes_backward(
             face_verts,
@@ -204,8 +231,14 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             grad_bin_size,
             grad_max_faces_per_bin,
             grad_perspective_correct,
+            grad_cull_backfaces,
         )
         return grads
+
+
+def pix_to_ndc(i, S):
+    # NDC x-offset + (i * pixel_width + half_pixel_width)
+    return -1 + (2 * i + 1.0) / S
 
 
 def rasterize_meshes_python(
@@ -214,6 +247,7 @@ def rasterize_meshes_python(
     blur_radius: float = 0.0,
     faces_per_pixel: int = 8,
     perspective_correct: bool = False,
+    cull_backfaces: bool = False,
 ):
     """
     Naive PyTorch implementation of mesh rasterization with the same inputs and
@@ -239,19 +273,13 @@ def rasterize_meshes_python(
     face_idxs = torch.full(
         (N, H, W, K), fill_value=-1, dtype=torch.int64, device=device
     )
-    zbuf = torch.full(
-        (N, H, W, K), fill_value=-1, dtype=torch.float32, device=device
-    )
+    zbuf = torch.full((N, H, W, K), fill_value=-1, dtype=torch.float32, device=device)
     bary_coords = torch.full(
         (N, H, W, K, 3), fill_value=-1, dtype=torch.float32, device=device
     )
     pix_dists = torch.full(
         (N, H, W, K), fill_value=-1, dtype=torch.float32, device=device
     )
-
-    # NDC is from [-1, 1]. Get pixel size using specified image size.
-    pixel_width = 2.0 / W
-    pixel_height = 2.0 / H
 
     # Calculate all face bounding boxes.
     x_mins = torch.min(faces_verts[:, :, 0], dim=1, keepdim=True).values
@@ -269,14 +297,20 @@ def rasterize_meshes_python(
     for n in range(N):
         face_start_idx = mesh_to_face_first_idx[n]
         face_stop_idx = face_start_idx + num_faces_per_mesh[n]
-        # Y coordinate of the top of the image.
-        yf = -1.0 + 0.5 * pixel_height
+
         # Iterate through the horizontal lines of the image from top to bottom.
         for yi in range(H):
-            # X coordinate of the left of the image.
-            xf = -1.0 + 0.5 * pixel_width
+            # Y coordinate of one end of the image. Reverse the ordering
+            # of yi so that +Y is pointing up in the image.
+            yfix = H - 1 - yi
+            yf = pix_to_ndc(yfix, H)
+
             # Iterate through pixels on this horizontal line, left to right.
             for xi in range(W):
+                # X coordinate of one end of the image. Reverse the ordering
+                # of xi so that +X is pointing to the left in the image.
+                xfix = W - 1 - xi
+                xf = pix_to_ndc(xfix, W)
                 top_k_points = []
 
                 # Check whether each face in the mesh affects this pixel.
@@ -284,7 +318,12 @@ def rasterize_meshes_python(
                     face = faces_verts[f].squeeze()
                     v0, v1, v2 = face.unbind(0)
 
-                    face_area = edge_function(v2, v0, v1)
+                    face_area = edge_function(v0, v1, v2)
+
+                    # Ignore triangles facing away from the camera.
+                    back_face = face_area < 0
+                    if cull_backfaces and back_face:
+                        continue
 
                     # Ignore faces which have zero area.
                     if face_area == 0.0:
@@ -302,9 +341,7 @@ def rasterize_meshes_python(
                         continue
 
                     # Compute barycentric coordinates and pixel z distance.
-                    pxy = torch.tensor(
-                        [xf, yf], dtype=torch.float32, device=device
-                    )
+                    pxy = torch.tensor([xf, yf], dtype=torch.float32, device=device)
 
                     bary = barycentric_coordinates(pxy, v0[:2], v1[:2], v2[:2])
                     if perspective_correct:
@@ -347,12 +384,6 @@ def rasterize_meshes_python(
                     bary_coords[n, yi, xi, k, 2] = bary[2]
                     pix_dists[n, yi, xi, k] = dist
 
-                # Move to the next horizontal pixel
-                xf += pixel_width
-
-            # Move to the next vertical pixel
-            yf += pixel_height
-
     return face_idxs, zbuf, bary_coords, pix_dists
 
 
@@ -370,8 +401,8 @@ def edge_function(p, v0, v1):
 
               .. code-block:: python
 
-                  A = p - v0
-                  B = v1 - v0
+                  B = p - v0
+                  A = v1 - v0
 
                         v1 ________
                           /\      /
@@ -445,8 +476,8 @@ def point_line_distance(p, v0, v1):
 
     v1v0 = v1 - v0
     l2 = v1v0.dot(v1v0)  # |v1 - v0|^2
-    if l2 == 0.0:
-        return torch.sqrt((p - v1).dot(p - v1))  # v0 == v1
+    if l2 <= kEpsilon:
+        return (p - v1).dot(p - v1)  # v0 == v1
 
     t = (v1v0).dot(p - v0) / l2
     t = torch.clamp(t, min=0.0, max=1.0)

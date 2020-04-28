@@ -5,9 +5,9 @@
 #include <list>
 #include <queue>
 #include <tuple>
-#include "geometry_utils.h"
-#include "vec2.h"
-#include "vec3.h"
+#include "utils/geometry_utils.h"
+#include "utils/vec2.h"
+#include "utils/vec3.h"
 
 float PixToNdc(int i, int S) {
   // NDC x-offset + (i * pixel_width + half_pixel_width)
@@ -105,9 +105,10 @@ RasterizeMeshesNaiveCpu(
     const torch::Tensor& mesh_to_face_first_idx,
     const torch::Tensor& num_faces_per_mesh,
     int image_size,
-    float blur_radius,
-    int faces_per_pixel,
-    bool perspective_correct) {
+    const float blur_radius,
+    const int faces_per_pixel,
+    const bool perspective_correct,
+    const bool cull_backfaces) {
   if (face_verts.ndimension() != 3 || face_verts.size(1) != 3 ||
       face_verts.size(2) != 3) {
     AT_ERROR("face_verts must have dimensions (num_faces, 3, 3)");
@@ -153,12 +154,19 @@ RasterizeMeshesNaiveCpu(
 
     // Iterate through the horizontal lines of the image from top to bottom.
     for (int yi = 0; yi < H; ++yi) {
+      // Reverse the order of yi so that +Y is pointing upwards in the image.
+      const int yidx = H - 1 - yi;
+
       // Y coordinate of the top of the pixel.
-      const float yf = PixToNdc(yi, H);
+      const float yf = PixToNdc(yidx, H);
       // Iterate through pixels on this horizontal line, left to right.
       for (int xi = 0; xi < W; ++xi) {
+        // Reverse the order of xi so that +X is pointing to the left in the
+        // image.
+        const int xidx = W - 1 - xi;
+
         // X coordinate of the left of the pixel.
-        const float xf = PixToNdc(xi, W);
+        const float xf = PixToNdc(xidx, W);
         // Use a priority queue to hold values:
         // (z, idx, r, bary.x, bary.y. bary.z)
         std::priority_queue<std::tuple<float, int, float, float, float, float>>
@@ -177,8 +185,13 @@ RasterizeMeshesNaiveCpu(
           const vec2<float> v1(x1, y1);
           const vec2<float> v2(x2, y2);
 
-          // Skip faces with zero area.
           const float face_area = face_areas_a[f];
+          const bool back_face = face_area < 0.0;
+          // Check if the face is visible to the camera.
+          if (cull_backfaces && back_face) {
+            continue;
+          }
+          // Skip faces with zero area.
           if (face_area <= kEpsilon && face_area >= -1.0f * kEpsilon) {
             continue;
           }
@@ -207,14 +220,15 @@ RasterizeMeshesNaiveCpu(
             continue; // Point is behind the image plane so ignore.
           }
 
-          // Compute absolute distance of the point to the triangle.
-          // If the point is inside the triangle then the distance
-          // is negative.
+          // Compute squared distance of the point to the triangle.
           const float dist = PointTriangleDistanceForward(pxy, v0, v1, v2);
 
           // Use the bary coordinates to determine if the point is
           // inside the face.
           const bool inside = bary.x > 0.0f && bary.y > 0.0f && bary.z > 0.0f;
+
+          // If the point is inside the triangle then signed_dist
+          // is negative.
           const float signed_dist = inside ? -dist : dist;
 
           // Check if pixel is outside blur region
@@ -250,7 +264,7 @@ torch::Tensor RasterizeMeshesBackwardCpu(
     const torch::Tensor& grad_zbuf, // (N, H, W, K)
     const torch::Tensor& grad_bary, // (N, H, W, K, 3)
     const torch::Tensor& grad_dists, // (N, H, W, K)
-    bool perspective_correct) {
+    const bool perspective_correct) {
   const int F = face_verts.size(0);
   const int N = pix_to_face.size(0);
   const int H = pix_to_face.size(1);
@@ -267,12 +281,19 @@ torch::Tensor RasterizeMeshesBackwardCpu(
   for (int n = 0; n < N; ++n) {
     // Iterate through the horizontal lines of the image from top to bottom.
     for (int y = 0; y < H; ++y) {
+      // Reverse the order of yi so that +Y is pointing upwards in the image.
+      const int yidx = H - 1 - y;
+
       // Y coordinate of the top of the pixel.
-      const float yf = PixToNdc(y, H);
+      const float yf = PixToNdc(yidx, H);
       // Iterate through pixels on this horizontal line, left to right.
       for (int x = 0; x < W; ++x) {
+        // Reverse the order of xi so that +X is pointing to the left in the
+        // image.
+        const int xidx = W - 1 - x;
+
         // X coordinate of the left of the pixel.
-        const float xf = PixToNdc(x, W);
+        const float xf = PixToNdc(xidx, W);
         const vec2<float> pxy(xf, yf);
 
         // Iterate through the faces that hit this pixel.
@@ -376,10 +397,10 @@ torch::Tensor RasterizeMeshesCoarseCpu(
     const torch::Tensor& face_verts,
     const torch::Tensor& mesh_to_face_first_idx,
     const torch::Tensor& num_faces_per_mesh,
-    int image_size,
-    float blur_radius,
-    int bin_size,
-    int max_faces_per_bin) {
+    const int image_size,
+    const float blur_radius,
+    const int bin_size,
+    const int max_faces_per_bin) {
   if (face_verts.ndimension() != 3 || face_verts.size(1) != 3 ||
       face_verts.size(2) != 3) {
     AT_ERROR("face_verts must have dimensions (num_faces, 3, 3)");
@@ -387,6 +408,7 @@ torch::Tensor RasterizeMeshesCoarseCpu(
   if (num_faces_per_mesh.ndimension() != 1) {
     AT_ERROR("num_faces_per_mesh can only have one dimension");
   }
+
   const int N = num_faces_per_mesh.size(0); // batch size.
   const int M = max_faces_per_bin;
 
@@ -399,7 +421,6 @@ torch::Tensor RasterizeMeshesCoarseCpu(
   auto opts = face_verts.options().dtype(torch::kInt32);
   torch::Tensor faces_per_bin = torch::zeros({N, BH, BW}, opts);
   torch::Tensor bin_faces = torch::full({N, BH, BW, M}, -1, opts);
-  auto faces_per_bin_a = faces_per_bin.accessor<int32_t, 3>();
   auto bin_faces_a = bin_faces.accessor<int32_t, 4>();
 
   // Precompute all face bounding boxes.
@@ -458,11 +479,11 @@ torch::Tensor RasterizeMeshesCoarseCpu(
           }
         }
 
-        // Shift the bin to the right for the next loop iteration.
+        // Shift the bin to the right for the next loop iteration
         bin_x_min = bin_x_max;
         bin_x_max = bin_x_min + bin_width;
       }
-      // Shift the bin down for the next loop iteration.
+      // Shift the bin down for the next loop iteration
       bin_y_min = bin_y_max;
       bin_y_max = bin_y_min + bin_width;
     }

@@ -1,12 +1,11 @@
-#!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 import itertools
 import math
 import unittest
-import torch
 
+import torch
 from pytorch3d.transforms.rotation_conversions import (
     euler_angles_to_matrix,
     matrix_to_euler_angles,
@@ -46,9 +45,7 @@ class TestRandomRotation(unittest.TestCase):
             )
             # The 0.1 significance level for chisquare(8-1) is
             # scipy.stats.chi2(7).ppf(0.9) == 12.017.
-            self.assertLess(
-                chisquare_statistic, 12, (counts, chisquare_statistic, k)
-            )
+            self.assertLess(chisquare_statistic, 12, (counts, chisquare_statistic, k))
 
 
 class TestRotationConversion(unittest.TestCase):
@@ -118,7 +115,6 @@ class TestRotationConversion(unittest.TestCase):
     def test_to_euler(self):
         """mtx -> euler -> mtx"""
         data = random_rotations(13, dtype=torch.float64)
-
         for convention in self._all_euler_angle_conventions():
             euler_angles = matrix_to_euler_angles(data, convention)
             mdata = euler_angles_to_matrix(euler_angles, convention)

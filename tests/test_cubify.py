@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import unittest
-import torch
 
+import torch
 from pytorch3d.ops import cubify
 
 
@@ -35,7 +34,7 @@ class TestCubify(unittest.TestCase):
         # 1st-check
         verts, faces = meshes.get_mesh_verts_faces(0)
         self.assertTrue(
-            torch.allclose(faces.max(), torch.tensor([verts.size(0) - 1]))
+            torch.allclose(faces.max().cpu(), torch.tensor([verts.size(0) - 1]))
         )
         self.assertTrue(
             torch.allclose(
@@ -82,7 +81,7 @@ class TestCubify(unittest.TestCase):
         # 2nd-check
         verts, faces = meshes.get_mesh_verts_faces(1)
         self.assertTrue(
-            torch.allclose(faces.max(), torch.tensor([verts.size(0) - 1]))
+            torch.allclose(faces.max().cpu(), torch.tensor([verts.size(0) - 1]))
         )
         self.assertTrue(
             torch.allclose(
@@ -276,9 +275,7 @@ class TestCubify(unittest.TestCase):
     @staticmethod
     def cubify_with_init(batch_size: int, V: int):
         device = torch.device("cuda:0")
-        voxels = torch.rand(
-            (batch_size, V, V, V), dtype=torch.float32, device=device
-        )
+        voxels = torch.rand((batch_size, V, V, V), dtype=torch.float32, device=device)
         torch.cuda.synchronize()
 
         def convert():
