@@ -67,6 +67,7 @@ class _knn_points(Function):
             idx = idx.gather(2, sort_idx)
 
         ctx.save_for_backward(p1, p2, lengths1, lengths2, idx)
+        ctx.mark_non_differentiable(idx)
         return dists, idx
 
     @staticmethod
@@ -115,18 +116,18 @@ def knn_points(
         return_nn: If set to True returns the K nearest neighors in p2 for each point in p1.
 
     Returns:
-        p1_idx: LongTensor of shape (N, P1, K) giving the indices of the
+        dists: Tensor of shape (N, P1, K) giving the squared distances to
+            the nearest neighbors. This is padded with zeros both where a cloud in p2
+            has fewer than K points and where a cloud in p1 has fewer than P1 points.
+
+        idx: LongTensor of shape (N, P1, K) giving the indices of the
             K nearest neighbors from points in p1 to points in p2.
             Concretely, if `p1_idx[n, i, k] = j` then `p2[n, j]` is the k-th nearest
             neighbors to `p1[n, i]` in `p2[n]`. This is padded with zeros both where a cloud
             in p2 has fewer than K points and where a cloud in p1 has fewer than P1
             points.
 
-        p1_dists: Tensor of shape (N, P1, K) giving the squared distances to
-            the nearest neighbors. This is padded with zeros both where a cloud in p2
-            has fewer than K points and where a cloud in p1 has fewer than P1 points.
-
-        p2_nn: Tensor of shape (N, P1, K, D) giving the K nearest neighbors in p2 for
+        nn: Tensor of shape (N, P1, K, D) giving the K nearest neighbors in p2 for
             each point in p1. Concretely, `p2_nn[n, i, k]` gives the k-th nearest neighbor
             for `p1[n, i]`. Returned if `return_nn` is True.
             The nearest neighbors are collected using `knn_gather`
@@ -156,6 +157,7 @@ def knn_points(
     if lengths2 is None:
         lengths2 = torch.full((p1.shape[0],), P2, dtype=torch.int64, device=p1.device)
 
+    # pyre-fixme[16]: `_knn_points` has no attribute `apply`.
     p1_dists, p1_idx = _knn_points.apply(p1, p2, lengths1, lengths2, K, version)
 
     p2_nn = None

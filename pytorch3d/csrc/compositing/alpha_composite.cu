@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <vector>
 
+__constant__ const float kEpsilon = 1e-9;
+
 // TODO(gkioxari) support all data types once AtomicAdd supports doubles.
 // Currently, support is for floats only.
 __global__ void alphaCompositeCudaForwardKernel(
@@ -126,7 +128,7 @@ __global__ void alphaCompositeCudaBackwardKernel(
         atomicAdd(
             &grad_alphas[batch][t][j][i],
             -grad_outputs[batch][ch][j][i] * features[ch][n_idx] * cum_alpha *
-                alpha / (1 - alpha_tvalue));
+                alpha / (1 - alpha_tvalue + kEpsilon));
       }
 
       cum_alpha = cum_alpha * (1 - alphas[batch][k][j][i]);
@@ -168,6 +170,8 @@ at::Tensor alphaCompositeCudaForward(
   // doubles. Currently, support is for floats only.
   alphaCompositeCudaForwardKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
       // clang-format off
+      // As we are using packed accessors here the tensors
+      // do not need to be made contiguous.
       result.packed_accessor64<float, 4, at::RestrictPtrTraits>(),
       features.packed_accessor64<float, 2, at::RestrictPtrTraits>(),
       alphas.packed_accessor64<float, 4, at::RestrictPtrTraits>(),
@@ -211,6 +215,8 @@ std::tuple<at::Tensor, at::Tensor> alphaCompositeCudaBackward(
   // doubles. Currently, support is for floats only.
   alphaCompositeCudaBackwardKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
       // clang-format off
+      // As we are using packed accessors here the tensors
+      // do not need to be made contiguous.
       grad_features.packed_accessor64<float, 2, at::RestrictPtrTraits>(),
       grad_alphas.packed_accessor64<float, 4, at::RestrictPtrTraits>(),
       grad_outputs.packed_accessor64<float, 4, at::RestrictPtrTraits>(),

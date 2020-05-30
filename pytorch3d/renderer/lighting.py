@@ -61,6 +61,7 @@ def diffuse(normals, color, direction) -> torch.Tensor:
         color = color.view(expand_dims)
 
     # Renormalize the normals in case they have been interpolated.
+    # We tried to replace the following with F.cosine_similarity, but it wasn't faster.
     normals = F.normalize(normals, p=2, dim=-1, eps=1e-6)
     direction = F.normalize(direction, p=2, dim=-1, eps=1e-6)
     angle = F.relu(torch.sum(normals * direction, dim=-1))
@@ -132,6 +133,8 @@ def specular(
         shininess = shininess.view(expand_dims)
 
     # Renormalize the normals in case they have been interpolated.
+    # We tried a version that uses F.cosine_similarity instead of renormalizing,
+    # but it was slower.
     normals = F.normalize(normals, p=2, dim=-1, eps=1e-6)
     direction = F.normalize(direction, p=2, dim=-1, eps=1e-6)
     cos_angle = torch.sum(normals * direction, dim=-1)
@@ -180,12 +183,13 @@ class DirectionalLights(TensorProperties):
             direction=direction,
         )
         _validate_light_properties(self)
+        # pyre-fixme[16]: `DirectionalLights` has no attribute `direction`.
         if self.direction.shape[-1] != 3:
             msg = "Expected direction to have shape (N, 3); got %r"
             raise ValueError(msg % repr(self.direction.shape))
 
     def clone(self):
-        other = DirectionalLights(device=self.device)
+        other = self.__class__(device=self.device)
         return super().clone(other)
 
     def diffuse(self, normals, points=None) -> torch.Tensor:
@@ -193,14 +197,20 @@ class DirectionalLights(TensorProperties):
         # the same for directional and point lights. The call sites should not
         # need to know the light type.
         return diffuse(
-            normals=normals, color=self.diffuse_color, direction=self.direction
+            normals=normals,
+            # pyre-fixme[16]: `DirectionalLights` has no attribute `diffuse_color`.
+            color=self.diffuse_color,
+            # pyre-fixme[16]: `DirectionalLights` has no attribute `direction`.
+            direction=self.direction,
         )
 
     def specular(self, normals, points, camera_position, shininess) -> torch.Tensor:
         return specular(
             points=points,
             normals=normals,
+            # pyre-fixme[16]: `DirectionalLights` has no attribute `specular_color`.
             color=self.specular_color,
+            # pyre-fixme[16]: `DirectionalLights` has no attribute `direction`.
             direction=self.direction,
             camera_position=camera_position,
             shininess=shininess,
@@ -239,23 +249,28 @@ class PointLights(TensorProperties):
             location=location,
         )
         _validate_light_properties(self)
+        # pyre-fixme[16]: `PointLights` has no attribute `location`.
         if self.location.shape[-1] != 3:
             msg = "Expected location to have shape (N, 3); got %r"
             raise ValueError(msg % repr(self.location.shape))
 
     def clone(self):
-        other = PointLights(device=self.device)
+        other = self.__class__(device=self.device)
         return super().clone(other)
 
     def diffuse(self, normals, points) -> torch.Tensor:
+        # pyre-fixme[16]: `PointLights` has no attribute `location`.
         direction = self.location - points
+        # pyre-fixme[16]: `PointLights` has no attribute `diffuse_color`.
         return diffuse(normals=normals, color=self.diffuse_color, direction=direction)
 
     def specular(self, normals, points, camera_position, shininess) -> torch.Tensor:
+        # pyre-fixme[16]: `PointLights` has no attribute `location`.
         direction = self.location - points
         return specular(
             points=points,
             normals=normals,
+            # pyre-fixme[16]: `PointLights` has no attribute `specular_color`.
             color=self.specular_color,
             direction=direction,
             camera_position=camera_position,

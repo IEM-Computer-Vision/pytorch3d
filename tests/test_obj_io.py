@@ -52,11 +52,11 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         )
         self.assertTrue(torch.all(verts == expected_verts))
         self.assertTrue(torch.all(faces.verts_idx == expected_faces))
-        padded_vals = -torch.ones_like(faces.verts_idx)
+        padded_vals = -(torch.ones_like(faces.verts_idx))
         self.assertTrue(torch.all(faces.normals_idx == padded_vals))
         self.assertTrue(torch.all(faces.textures_idx == padded_vals))
         self.assertTrue(
-            torch.all(faces.materials_idx == -torch.ones(len(expected_faces)))
+            torch.all(faces.materials_idx == -(torch.ones(len(expected_faces))))
         )
         self.assertTrue(normals is None)
         self.assertTrue(textures is None)
@@ -124,10 +124,12 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
             [[0.749279, 0.501284], [0.999110, 0.501077], [0.999455, 0.750380]],
             dtype=torch.float32,
         )
-        expected_faces_normals_idx = -torch.ones_like(expected_faces, dtype=torch.int64)
+        expected_faces_normals_idx = -(
+            torch.ones_like(expected_faces, dtype=torch.int64)
+        )
         expected_faces_normals_idx[4, :] = torch.tensor([1, 1, 1], dtype=torch.int64)
-        expected_faces_textures_idx = -torch.ones_like(
-            expected_faces, dtype=torch.int64
+        expected_faces_textures_idx = -(
+            torch.ones_like(expected_faces, dtype=torch.int64)
         )
         expected_faces_textures_idx[4, :] = torch.tensor([0, 0, 1], dtype=torch.int64)
 
@@ -207,7 +209,7 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         self.assertClose(expected_textures, textures)
         self.assertClose(expected_verts, verts)
         self.assertTrue(
-            torch.all(faces.normals_idx == -torch.ones_like(faces.textures_idx))
+            torch.all(faces.normals_idx == -(torch.ones_like(faces.textures_idx)))
         )
         self.assertTrue(normals is None)
         self.assertTrue(materials is None)
@@ -606,6 +608,12 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         mesh3 = load_objs_as_meshes([obj_filename, obj_filename, obj_filename])
         check_triple(mesh, mesh3)
         self.assertTupleEqual(mesh.textures.maps_padded().shape, (1, 1024, 1024, 3))
+
+        # Try mismatched texture map sizes, which needs a call to interpolate()
+        mesh2048 = mesh.clone()
+        maps = mesh.textures.maps_padded()
+        mesh2048.textures._maps_padded = torch.cat([maps, maps], dim=1)
+        join_meshes_as_batch([mesh.to("cuda:0"), mesh2048.to("cuda:0")])
 
         mesh_notex = load_objs_as_meshes([obj_filename], load_textures=False)
         mesh3_notex = load_objs_as_meshes(

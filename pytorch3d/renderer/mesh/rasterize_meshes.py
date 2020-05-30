@@ -132,6 +132,7 @@ def rasterize_meshes(
     if max_faces_per_bin is None:
         max_faces_per_bin = int(max(10000, verts_packed.shape[0] / 5))
 
+    # pyre-fixme[16]: `_RasterizeFaceVerts` has no attribute `apply`.
     return _RasterizeFaceVerts.apply(
         face_verts,
         mesh_to_face_first_idx,
@@ -184,6 +185,7 @@ class _RasterizeFaceVerts(torch.autograd.Function):
         perspective_correct: bool = False,
         cull_backfaces: bool = False,
     ):
+        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
         pix_to_face, zbuf, barycentric_coords, dists = _C.rasterize_meshes(
             face_verts,
             mesh_to_face_first_idx,
@@ -197,6 +199,7 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             cull_backfaces,
         )
         ctx.save_for_backward(face_verts, pix_to_face)
+        ctx.mark_non_differentiable(pix_to_face)
         ctx.perspective_correct = perspective_correct
         return pix_to_face, zbuf, barycentric_coords, dists
 
@@ -259,7 +262,7 @@ def rasterize_meshes_python(
     N = len(meshes)
     # Assume only square images.
     # TODO(T52813608) extend support for non-square images.
-    H, W, = image_size, image_size
+    H, W = image_size, image_size
     K = faces_per_pixel
     device = meshes.device
 
@@ -282,6 +285,7 @@ def rasterize_meshes_python(
     )
 
     # Calculate all face bounding boxes.
+    # pyre-fixme[16]: `Tuple` has no attribute `values`.
     x_mins = torch.min(faces_verts[:, :, 0], dim=1, keepdim=True).values
     x_maxs = torch.max(faces_verts[:, :, 0], dim=1, keepdim=True).values
     y_mins = torch.min(faces_verts[:, :, 1], dim=1, keepdim=True).values
@@ -479,7 +483,7 @@ def point_line_distance(p, v0, v1):
     if l2 <= kEpsilon:
         return (p - v1).dot(p - v1)  # v0 == v1
 
-    t = (v1v0).dot(p - v0) / l2
+    t = v1v0.dot(p - v0) / l2
     t = torch.clamp(t, min=0.0, max=1.0)
     p_proj = v0 + t * v1v0
     delta_p = p_proj - p

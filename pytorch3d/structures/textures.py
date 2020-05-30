@@ -3,7 +3,7 @@
 from typing import List, Optional, Union
 
 import torch
-import torchvision.transforms as T
+from torch.nn.functional import interpolate
 
 from .utils import padded_to_list, padded_to_packed
 
@@ -18,10 +18,10 @@ def _pad_texture_maps(images: List[torch.Tensor]) -> torch.Tensor:
     Pad all texture images so they have the same height and width.
 
     Args:
-        images: list of N tensors of shape (H, W)
+        images: list of N tensors of shape (H, W, 3)
 
     Returns:
-        tex_maps: Tensor of shape (N, max_H, max_W)
+        tex_maps: Tensor of shape (N, max_H, max_W, 3)
     """
     tex_maps = []
     max_H = 0
@@ -35,15 +35,13 @@ def _pad_texture_maps(images: List[torch.Tensor]) -> torch.Tensor:
         tex_maps.append(im)
     max_shape = (max_H, max_W)
 
-    # If all texture images are not the same size then resize to the
-    # largest size.
-    resize = T.Compose([T.ToPILImage(), T.Resize(size=max_shape), T.ToTensor()])
-
     for i, image in enumerate(tex_maps):
-        if image.shape != max_shape:
-            # ToPIL takes and returns a C x H x W tensor
-            image = resize(image.permute(2, 0, 1)).permute(1, 2, 0)
-            tex_maps[i] = image
+        if image.shape[:2] != max_shape:
+            image_BCHW = image.permute(2, 0, 1)[None]
+            new_image_BCHW = interpolate(
+                image_BCHW, size=max_shape, mode="bilinear", align_corners=False
+            )
+            tex_maps[i] = new_image_BCHW[0].permute(1, 2, 0)
     tex_maps = torch.stack(tex_maps, dim=0)  # (num_tex_maps, max_H, max_W, 3)
     return tex_maps
 
@@ -65,6 +63,7 @@ def _extend_tensor(input_tensor: torch.Tensor, N: int) -> torch.Tensor:
         input_tensor: torch.Tensor with ndim > 2 representing a batched input.
         N: number of times to extend each element of the batch.
     """
+    # pyre-fixme[16]: `Tensor` has no attribute `ndim`.
     if input_tensor.ndim < 2:
         raise ValueError("Input tensor must have ndimensions >= 2.")
     B = input_tensor.shape[0]
@@ -100,6 +99,7 @@ class Textures(object):
         and the packed/list representations are computed on the fly and
         not cached.
         """
+        # pyre-fixme[16]: `Tensor` has no attribute `ndim`.
         if faces_uvs is not None and faces_uvs.ndim != 3:
             msg = "Expected faces_uvs to be of shape (N, F, 3); got %r"
             raise ValueError(msg % repr(faces_uvs.shape))
@@ -110,8 +110,10 @@ class Textures(object):
             msg = "Expected verts_rgb to be of shape (N, V, 3); got %r"
             raise ValueError(msg % repr(verts_rgb.shape))
         if maps is not None:
+            # pyre-fixme[16]: `List` has no attribute `ndim`.
             if torch.is_tensor(maps) and maps.ndim != 4:
                 msg = "Expected maps to be of shape (N, H, W, 3); got %r"
+                # pyre-fixme[16]: `List` has no attribute `shape`.
                 raise ValueError(msg % repr(maps.shape))
             elif isinstance(maps, list):
                 maps = _pad_texture_maps(maps)
@@ -131,7 +133,7 @@ class Textures(object):
         self._num_verts_per_mesh = None
 
     def clone(self):
-        other = Textures()
+        other = self.__class__()
         for k in dir(self):
             v = getattr(self, k)
             if torch.is_tensor(v):
@@ -146,7 +148,7 @@ class Textures(object):
         return self
 
     def __getitem__(self, index):
-        other = Textures()
+        other = self.__class__()
         for key in dir(self):
             value = getattr(self, key)
             if torch.is_tensor(value):
@@ -157,20 +159,27 @@ class Textures(object):
         return other
 
     def faces_uvs_padded(self) -> torch.Tensor:
+        # pyre-fixme[7]: Expected `Tensor` but got `Optional[torch.Tensor]`.
         return self._faces_uvs_padded
 
     def faces_uvs_list(self) -> Union[List[torch.Tensor], None]:
         if self._faces_uvs_padded is None:
             return None
         return padded_to_list(
-            self._faces_uvs_padded, split_size=self._num_faces_per_mesh
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
+            self._faces_uvs_padded,
+            split_size=self._num_faces_per_mesh,
         )
 
     def faces_uvs_packed(self) -> Union[torch.Tensor, None]:
         if self._faces_uvs_padded is None:
             return None
         return padded_to_packed(
-            self._faces_uvs_padded, split_size=self._num_faces_per_mesh
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
+            self._faces_uvs_padded,
+            split_size=self._num_faces_per_mesh,
         )
 
     def verts_uvs_padded(self) -> Union[torch.Tensor, None]:
@@ -184,6 +193,8 @@ class Textures(object):
         # each face so the num_verts_uvs_per_mesh
         # may be different from num_verts_per_mesh.
         # Therefore don't use any split_size.
+        # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+        #  `Optional[torch.Tensor]`.
         return padded_to_list(self._verts_uvs_padded)
 
     def verts_uvs_packed(self) -> Union[torch.Tensor, None]:
@@ -194,6 +205,8 @@ class Textures(object):
         # each face so the num_verts_uvs_per_mesh
         # may be different from num_verts_per_mesh.
         # Therefore don't use any split_size.
+        # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+        #  `Optional[torch.Tensor]`.
         return padded_to_packed(self._verts_uvs_padded)
 
     def verts_rgb_padded(self) -> Union[torch.Tensor, None]:
@@ -203,18 +216,26 @@ class Textures(object):
         if self._verts_rgb_padded is None:
             return None
         return padded_to_list(
-            self._verts_rgb_padded, split_size=self._num_verts_per_mesh
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
+            self._verts_rgb_padded,
+            split_size=self._num_verts_per_mesh,
         )
 
     def verts_rgb_packed(self) -> Union[torch.Tensor, None]:
         if self._verts_rgb_padded is None:
             return None
         return padded_to_packed(
-            self._verts_rgb_padded, split_size=self._num_verts_per_mesh
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
+            self._verts_rgb_padded,
+            split_size=self._num_verts_per_mesh,
         )
 
     # Currently only the padded maps are used.
     def maps_padded(self) -> Union[torch.Tensor, None]:
+        # pyre-fixme[7]: Expected `Optional[torch.Tensor]` but got `Union[None,
+        #  List[typing.Any], torch.Tensor]`.
         return self._maps_padded
 
     def extend(self, N: int) -> "Textures":
@@ -236,15 +257,23 @@ class Textures(object):
             v is not None
             for v in [self._faces_uvs_padded, self._verts_uvs_padded, self._maps_padded]
         ):
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
             new_verts_uvs = _extend_tensor(self._verts_uvs_padded, N)
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
             new_faces_uvs = _extend_tensor(self._faces_uvs_padded, N)
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got `Union[None,
+            #  List[typing.Any], torch.Tensor]`.
             new_maps = _extend_tensor(self._maps_padded, N)
-            return Textures(
+            return self.__class__(
                 verts_uvs=new_verts_uvs, faces_uvs=new_faces_uvs, maps=new_maps
             )
         elif self._verts_rgb_padded is not None:
+            # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+            #  `Optional[torch.Tensor]`.
             new_verts_rgb = _extend_tensor(self._verts_rgb_padded, N)
-            return Textures(verts_rgb=new_verts_rgb)
+            return self.__class__(verts_rgb=new_verts_rgb)
         else:
             msg = "Either vertex colors or texture maps are required."
             raise ValueError(msg)

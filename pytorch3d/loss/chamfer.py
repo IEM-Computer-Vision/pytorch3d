@@ -41,6 +41,7 @@ def _handle_pointcloud_input(
         lengths = points.num_points_per_cloud()
         normals = points.normals_padded()  # either a tensor or None
     elif torch.is_tensor(points):
+        # pyre-fixme[16]: `Tensor` has no attribute `ndim`.
         if points.ndim != 3:
             raise ValueError("Expected points to be of shape (N, P, D)")
         X = points
@@ -117,8 +118,8 @@ def chamfer_distance(
     P2 = y.shape[1]
 
     # Check if inputs are heterogeneous and create a lengths mask.
-    is_x_heterogeneous = ~(x_lengths == P1).all()
-    is_y_heterogeneous = ~(y_lengths == P2).all()
+    is_x_heterogeneous = (x_lengths != P1).any()
+    is_y_heterogeneous = (y_lengths != P2).any()
     x_mask = (
         torch.arange(P1, device=x.device)[None] >= x_lengths[:, None]
     )  # shape [N, P1]
@@ -173,6 +174,7 @@ def chamfer_distance(
         )
 
         if is_x_heterogeneous:
+            # pyre-fixme[16]: `int` has no attribute `__setitem__`.
             cham_norm_x[x_mask] = 0.0
         if is_y_heterogeneous:
             cham_norm_y[y_mask] = 0.0
